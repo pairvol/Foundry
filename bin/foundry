@@ -1,0 +1,338 @@
+#!/usr/bin/env gjs
+
+imports.gi.versions.Gtk = '4.0';
+imports.gi.versions.Gdk = '4.0';
+
+const {Gdk, Gio, GLib, GObject, Gtk} = imports.gi;
+
+const APP_ID = GLib.getenv('FOUNDRY_APP_ID') || 'dev.pairvol.Foundry';
+
+// Same "Default Dark" palette as pv-term/nce-gui/Wraith/VoidScribe, so
+// Foundry reads as part of the same family rather than a bolted-on tool.
+const PALETTE = {
+    bg: '#0f1218',
+    fg: '#e6edf3',
+    accent: '#39c5cf',
+    dimFg: 'rgba(230, 237, 243, 0.65)',
+};
+
+// MOCKUP DATA, mostly -- this is the part that becomes real later. Each
+// pairvol entry describes an app Foundry can (eventually) fetch/build/
+// install; `desktopId` is used only to detect whether it's already
+// installed (so the button can say "Open" and actually work) and
+// `source` is just display text -- no fetch/build logic exists for these
+// yet, since that means cloning + running each project's own installer.
+//
+// Spotify is the one real end-to-end test: it has an official snap, so
+// there's no clone/build step -- `pkexec snap install spotify` is the
+// whole install. Wired up for real (installArgs + checkCommand) as a
+// proof that Foundry's install flow (privilege prompt, async run, button
+// state, error handling) actually works before building the harder
+// git-clone-and-build path for the pairvol apps.
+const APPS = [
+    {
+        name: 'VoidScribe',
+        kind: 'pairvol',
+        desktopId: 'dev.pairvol.VoidScribe',
+        description: 'Minimalist document editor -- rich Markdown/DOCX/ODT editing without becoming a LibreOffice clone.',
+        source: 'github.com/pairvol/VoidScribe',
+    },
+    {
+        name: 'Wraith',
+        kind: 'pairvol',
+        desktopId: 'dev.pairvol.WraithFileManager',
+        description: 'Native GTK4 file manager, built as a Nemo/Nautilus replacement.',
+        source: 'github.com/pairvol/WraithFileManager',
+    },
+    {
+        name: 'Native Code Editor',
+        kind: 'pairvol',
+        desktopId: 'dev.pairvol.NativeCodeEditor',
+        description: 'Native Linux code editor -- no Electron, no browser runtime.',
+        source: 'github.com/pairvol/CodeEditor',
+    },
+    {
+        name: 'NullWire',
+        kind: 'pairvol',
+        desktopId: 'dev.pairvol.NullWire',
+        description: "Firefox with the bloat cut out -- a profile and policy layer, not a source fork.",
+        source: 'local project (profile/policy layer on stock Firefox)',
+    },
+    {
+        name: 'Spotify',
+        kind: 'snap',
+        icon: 'multimedia-player',
+        checkCommand: 'spotify',
+        installArgs: ['pkexec', 'snap', 'install', 'spotify'],
+        description: 'Music streaming client.',
+        source: 'snap: spotify (official, Spotify-verified publisher)',
+    },
+];
+
+function hexShade(hex, amount) {
+    const n = hex.replace('#', '');
+    const r = parseInt(n.slice(0, 2), 16), g = parseInt(n.slice(2, 4), 16), b = parseInt(n.slice(4, 6), 16);
+    const mix = amount < 0
+        ? [r, g, b].map(v => Math.round(v * (1 + amount)))
+        : [r, g, b].map(v => Math.round(v + (255 - v) * amount));
+    return `rgb(${mix[0]}, ${mix[1]}, ${mix[2]})`;
+}
+
+function hexAlpha(hex, alpha) {
+    const n = hex.replace('#', '');
+    const r = parseInt(n.slice(0, 2), 16), g = parseInt(n.slice(2, 4), 16), b = parseInt(n.slice(4, 6), 16);
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function isInstalled(app) {
+    if (app.kind === 'snap')
+        return !!GLib.find_program_in_path(app.checkCommand);
+    const path = GLib.build_filenamev([GLib.get_user_data_dir(), 'applications', `${app.desktopId}.desktop`]);
+    return GLib.file_test(path, GLib.FileTest.EXISTS);
+}
+
+// Same pattern as VoidScribe/nce-gui's process helpers: SubprocessLauncher
+// + communicate_utf8_async, callback gets (ok, stdout, stderr).
+function runProcessAsync(args, callback) {
+    try {
+        const launcher = new Gio.SubprocessLauncher({
+            flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
+        });
+        const process = launcher.spawnv(args);
+        process.communicate_utf8_async(null, null, (proc, result) => {
+            try {
+                const [, stdout, stderr] = proc.communicate_utf8_finish(result);
+                callback(proc.get_exit_status() === 0, stdout || '', stderr || '');
+            } catch (error) {
+                callback(false, '', error.message || String(error));
+            }
+        });
+    } catch (error) {
+        callback(false, '', error.message || String(error));
+    }
+}
+
+const FoundryWindow = GObject.registerClass(
+class FoundryWindow extends Gtk.ApplicationWindow {
+    _init(application) {
+        super._init({application, title: 'Foundry', default_width: 720, default_height: 640});
+        this.add_css_class('fd-window');
+        this._buildCss();
+        this._buildChrome();
+        this._buildBody();
+    }
+
+    _buildCss() {
+        const css = new Gtk.CssProvider();
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        );
+        const {bg, fg, accent, dimFg} = PALETTE;
+        const cardBg = hexShade(bg, -0.25);
+        const data = `
+            window.fd-window { background-color: ${bg}; }
+            .fd-chrome { background-color: ${hexShade(bg, -0.35)}; }
+            .fd-titlebar { border-top: 3px solid ${accent}; }
+            .fd-brand { font-weight: 700; font-size: 12pt; color: ${fg}; }
+            .fd-subtitle { color: ${dimFg}; font-size: 90%; }
+            .fd-card {
+                background-color: ${cardBg};
+                border-radius: 12px;
+                padding: 14px;
+            }
+            .fd-app-name { font-weight: 700; font-size: 11pt; color: ${fg}; }
+            .fd-app-desc { color: ${dimFg}; font-size: 90%; }
+            .fd-app-source { color: ${hexAlpha(accent, 0.8)}; font-size: 80%; font-family: monospace; }
+            .fd-install-btn {
+                border-radius: 999px;
+                padding: 6px 18px;
+                font-weight: 600;
+                background-color: ${hexAlpha(accent, 0.18)};
+                color: ${accent};
+            }
+            .fd-install-btn:hover { background-color: ${hexAlpha(accent, 0.32)}; }
+            .fd-open-btn {
+                border-radius: 999px;
+                padding: 6px 18px;
+                font-weight: 600;
+                background-color: ${hexShade(bg, -0.45)};
+                color: ${fg};
+            }
+            .fd-open-btn:hover { background-color: ${hexShade(bg, -0.55)}; }
+            .fd-footer { color: ${dimFg}; font-size: 85%; }
+        `;
+        css.load_from_data(data, data.length);
+    }
+
+    _buildChrome() {
+        const chrome = new Gtk.Box({orientation: Gtk.Orientation.VERTICAL});
+        chrome.add_css_class('fd-chrome');
+
+        const titleRow = new Gtk.Box({
+            orientation: Gtk.Orientation.HORIZONTAL, spacing: 8,
+            margin_top: 10, margin_bottom: 10, margin_start: 14, margin_end: 10,
+        });
+        titleRow.add_css_class('fd-titlebar');
+
+        const brandBox = new Gtk.Box({orientation: Gtk.Orientation.VERTICAL, spacing: 2});
+        const brand = new Gtk.Label({label: 'Foundry', xalign: 0});
+        brand.add_css_class('fd-brand');
+        const subtitle = new Gtk.Label({label: 'Set up your machine in a few clicks', xalign: 0});
+        subtitle.add_css_class('fd-subtitle');
+        brandBox.append(brand);
+        brandBox.append(subtitle);
+        titleRow.append(brandBox);
+
+        titleRow.append(new Gtk.Box({hexpand: true}));
+        titleRow.append(new Gtk.WindowControls({side: Gtk.PackType.END}));
+        chrome.append(titleRow);
+
+        this.set_titlebar(new Gtk.WindowHandle({child: chrome}));
+    }
+
+    _buildBody() {
+        const outer = new Gtk.Box({orientation: Gtk.Orientation.VERTICAL, vexpand: true});
+
+        const scroller = new Gtk.ScrolledWindow({vexpand: true, hexpand: true});
+        const list = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL, spacing: 10,
+            margin_top: 16, margin_bottom: 16, margin_start: 16, margin_end: 16,
+        });
+        for (const app of APPS)
+            list.append(this._buildAppCard(app));
+        scroller.set_child(list);
+        outer.append(scroller);
+
+        const footer = new Gtk.Label({
+            label: 'Mockup -- most install actions aren’t wired up yet (Spotify is a real end-to-end test via snap). This will grow into a full distro app store later.',
+            xalign: 0, wrap: true,
+            margin_top: 4, margin_bottom: 10, margin_start: 16, margin_end: 16,
+        });
+        footer.add_css_class('fd-footer');
+        outer.append(footer);
+
+        this.set_child(outer);
+    }
+
+    _buildAppCard(app) {
+        const card = new Gtk.Box({orientation: Gtk.Orientation.HORIZONTAL, spacing: 14});
+        card.add_css_class('fd-card');
+
+        const icon = new Gtk.Image({icon_name: app.icon || app.desktopId, pixel_size: 48});
+        icon.set_valign(Gtk.Align.START);
+        card.append(icon);
+
+        const textBox = new Gtk.Box({orientation: Gtk.Orientation.VERTICAL, spacing: 3, hexpand: true});
+        const nameLabel = new Gtk.Label({label: app.name, xalign: 0});
+        nameLabel.add_css_class('fd-app-name');
+        const descLabel = new Gtk.Label({label: app.description, xalign: 0, wrap: true});
+        descLabel.add_css_class('fd-app-desc');
+        const sourceLabel = new Gtk.Label({label: app.source, xalign: 0});
+        sourceLabel.add_css_class('fd-app-source');
+        textBox.append(nameLabel);
+        textBox.append(descLabel);
+        textBox.append(sourceLabel);
+        card.append(textBox);
+
+        const button = new Gtk.Button({valign: Gtk.Align.CENTER});
+        this._refreshButtonState(app, button);
+        button.connect('clicked', () => {
+            if (isInstalled(app))
+                this._launchApp(app);
+            else if (app.installArgs)
+                this._installApp(app, button);
+            else
+                this._showComingSoon(app);
+        });
+        card.append(button);
+
+        return card;
+    }
+
+    // Sets the button's label/style from the app's *current* installed
+    // state -- called at card build time and again after a real install
+    // finishes, so a successful Spotify install flips its button to
+    // "Open" without rebuilding the card.
+    _refreshButtonState(app, button) {
+        const installed = isInstalled(app);
+        button.set_label(installed ? 'Open' : 'Install');
+        button.remove_css_class('fd-open-btn');
+        button.remove_css_class('fd-install-btn');
+        button.add_css_class(installed ? 'fd-open-btn' : 'fd-install-btn');
+        button.set_sensitive(true);
+    }
+
+    _launchApp(app) {
+        if (app.kind === 'snap') {
+            try {
+                new Gio.Subprocess({argv: [app.checkCommand]}).init(null);
+            } catch (error) {
+                this._showError(`Couldn't launch ${app.name}: ${error.message}`);
+            }
+            return;
+        }
+        try {
+            const appInfo = Gio.DesktopAppInfo.new(`${app.desktopId}.desktop`);
+            if (appInfo)
+                appInfo.launch([], null);
+            else
+                this._showError(`Couldn't find ${app.name}'s launcher entry.`);
+        } catch (error) {
+            this._showError(`Couldn't launch ${app.name}: ${error.message}`);
+        }
+    }
+
+    // The one real install path (see APPS comment) -- runs installArgs
+    // (currently just Spotify's `pkexec snap install spotify`), which
+    // prompts for authentication via the desktop's own polkit dialog, not
+    // anything Foundry draws itself.
+    _installApp(app, button) {
+        button.set_sensitive(false);
+        button.set_label('Installing…');
+        runProcessAsync(app.installArgs, (ok, stdout, stderr) => {
+            if (ok) {
+                this._refreshButtonState(app, button);
+            } else {
+                button.set_sensitive(true);
+                button.set_label('Install');
+                const detail = (stderr || stdout || '').trim();
+                this._showError(`Couldn't install ${app.name}${detail ? `:\n${detail}` : ' (cancelled or failed).'}`);
+            }
+        });
+    }
+
+    _showComingSoon(app) {
+        const dialog = new Gtk.MessageDialog({
+            transient_for: this, modal: true,
+            message_type: Gtk.MessageType.INFO,
+            text: `Install ${app.name}`,
+            secondary_text: "Not wired up yet -- this mockup shows what Foundry will look like. Actual fetch/build/install logic comes later.",
+        });
+        dialog.add_button('OK', Gtk.ResponseType.OK);
+        dialog.connect('response', () => dialog.destroy());
+        dialog.present();
+    }
+
+    _showError(message) {
+        const dialog = new Gtk.MessageDialog({
+            transient_for: this, modal: true,
+            message_type: Gtk.MessageType.ERROR,
+            text: 'Foundry', secondary_text: message,
+        });
+        dialog.add_button('OK', Gtk.ResponseType.OK);
+        dialog.connect('response', () => dialog.destroy());
+        dialog.present();
+    }
+});
+
+const app = new Gtk.Application({
+    application_id: APP_ID,
+    flags: Gio.ApplicationFlags.NON_UNIQUE,
+});
+
+app.connect('activate', application => {
+    const win = new FoundryWindow(application);
+    win.present();
+});
+
+app.run([imports.system.programInvocationName, ...ARGV]);

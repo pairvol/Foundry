@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Foundry
+Comment=Set up your machine in a few clicks (mockup -- install actions not wired up yet)
+Icon=applications-system
+Exec=foundry
+Terminal=false
+Categories=System;Utility;
+StartupNotify=true
